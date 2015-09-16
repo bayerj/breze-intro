@@ -1,0 +1,220 @@
+[INCLUDE=presentation]
+Title         : A short introduction to Breze
+Sub Title     : Pointing to places where to start reading 
+Author        : Justin Bayer
+Affiliation   : 
+Email         : bayer.justin@googlemail.com
+Reveal Theme  : default
+Beamer Theme  : singapore
+
+[TITLE]
+
+# Why?
+
+ * Rapid testing of gradient-based machine learning models,
+ * Get rid of the repetetitive low level stuff,
+ * Get rid of the repetetitve high level stuff,
+ * The *interesting stuff is in between*.
+
+## Low level stuff
+
+* Gradient-based optimisation (climin),
+* Automated differentiation for gradients (Theano)
+* Minor memory management of adaptable parameters, 
+* Composition of models (Convolutional recurrent auto encoder trained with SGVB using dropout and heteroskedastic Gaussian likelihood functions).
+
+
+## High level stuff
+
+ * Configuration of optimiser,
+ * Iterative training scheme as in climin,
+ * Automated computation of training/validation/test loss at sensible times during learning,
+ * GPU/CPU transparency,
+ * Shut down an experiment (power outage?) and continue later,
+ * Make sure everything is picklable,
+ * Inherit stopping criterions from climin,
+ * Initialisation of models (WIP),
+ * Take away some of repetitive work required by Theano (e.g. test values).
+
+
+# Structure of Breze
+
+There are three layers, represented by packages
+
+ * ``breze.learn`` -- Learning algorithms.
+ * ``breze.arch.construct`` -- things that are parameterised, but do not have a learning method attached.
+ * ``breze.arch.component`` -- Transfer functions, loss functions, density functions, etc.
+ 
+Sadly, there is currently no clear definition what belongs where. Need to find sth that matches the code base. :()
+
+
+## Linear model in ``learn`` 1
+
+```python
+class Linear(SupervisedModel):
+    """Class to represent a linear model."""
+
+    def __init__(self, n_inpt, n_output,
+                 out_transfer='identity', loss='squared',
+                 optimizer='adam', batch_size=None,
+                 max_iter=1000, verbose=False):
+        self.n_inpt = n_inpt
+        self.loss_ident = loss
+        # .... snip ...
+
+        self.f_predict = None
+        self._init_exprs()
+```
+
+* inherits from ``SupervisedModel`` for all the learning book keeping,
+* uses ``out_transfer`` and ``loss`` to find equally named functions in ``breze.arch.component.transfer`` and ``breze.arch.component.loss``,
+* uses ``optimizer`` to create a cimin optimizer 
+  * can be a tuple of the form 
+    ``('adam', {'step_rate': .001})``
+* uses a batch size to iterate over data later
+* ``max_iter`` and ``verbose`` are there for ``sklearn`` compatibility, but should actually go.
+* calls ``_init_exprs()`` which should define the theano expressions. 
+
+
+## Linear model in ``learn`` 2 
+
+```python
+    def _init_exprs(self):
+        inpt = T.matrix('inpt')
+        target = T.matrix('target')
+        parameters = ParameterSet()
+
+        if theano.config.compute_test_value:
+            inpt.tag.test_value = np.empty((2, self.n_inpt))
+            target.tag.test_value = np.empty((2, self.n_output))
+
+        self.predict_layer = AffineNonlinear(
+            inpt, self.n_inpt, self.n_output, self.out_transfer_ident,
+            use_bias=True, declare=parameters.declare)
+
+        self.loss_layer = SupervisedLoss(
+            target, self.predict_layer.output, loss=self.loss_ident,
+            declare=parameters.declare,
+        )
+
+        SupervisedModel.__init__(self, inpt=inpt, target=target,
+                                 output=self.predict_layer.output,
+                                 loss=self.loss_layer.total,
+                                 parameters=parameters)
+```
+ * Creates data theano variables ``inpt`` and ``target``,
+ * Creates ``ParameterSet`` object, which holds all the learnable parameters,
+ * Assigns test values for theano debugging,
+ * Uses ``AffineNonLinear`` and ``SupervisedLoss`` to create expressions,
+ * Calls super class's constructor to assign expressions to fields that the superclass understands.
+
+
+## ``AffineNonLinear`` in ``construct`` 1
+
+```python
+class AffineNonlinear(Layer):
+
+    # ... snip ...
+
+    def __init__(self, inpt, n_inpt, n_output, transfer='identity',
+                 use_bias=True, declare=None, name=None):
+        self.inpt = inpt
+        self._n_inpt = n_inpt
+        self._n_output = n_output
+        self.transfer = transfer
+        self.use_bias = use_bias
+        super(AffineNonlinear, self).__init__(declare=declare, name=name)
+
+    def _forward(self):
+        # ... snip ....
+```
+
+ * Assigns fields
+
+
+## ``AffineNonLinear`` in ``construct`` 2
+
+```python
+class AffineNonlinear(Layer):
+
+    # ... snip ...
+
+    def __init__(self, inpt, n_inpt, n_output, transfer='identity',
+                 use_bias=True, declare=None, name=None):
+        # ... snip ...    
+
+    def _forward(self):
+        # ... snip ....
+        self.weights = self.declare((self.n_inpt, self.n_output))
+
+        self.output_in = T.dot(self.inpt, self.weights)
+
+        if self.use_bias:
+            self.bias = self.declare(self.n_output)
+            self.output_in += self.bias
+
+        f = lookup(self.transfer, _transfer)
+
+        self.output = f(self.output_in)
+```
+
+ * Defines parameters with ``self.declare``
+ * Constructs expressions from parameters and inputs.
+
+## ``SupervisedLoss`` in ``construct`` 1
+
+```python 
+class SupervisedLoss(Layer):
+
+    def __init__(self, target, prediction, loss, comp_dim=1, imp_weight=None,
+                 declare=None, name=None):
+        self.target = target
+        self.prediction = prediction
+        self.loss_ident = loss
+
+        self.imp_weight = imp_weight
+        self.comp_dim = comp_dim
+
+        super(SupervisedLoss, self).__init__(declare, name)
+
+    def _forward(self):
+        # ... snip ...
+ ```
+ 
+  * Assigns fields
+
+
+## ``SupervisedLoss`` in ``construct`` 2
+
+```python 
+class SupervisedLoss(Layer):
+
+    def __init__(self, target, prediction, loss, comp_dim=1, imp_weight=None,
+                 declare=None, name=None):
+        # ... snip ...
+
+    def _forward(self):
+        f_loss = lookup(self.loss_ident, _loss)
+
+        self.coord_wise = f_loss(self.target, self.prediction)
+
+        if self.imp_weight is not None:
+            self.coord_wise *= self.imp_weight
+
+        self.sample_wise = self.coord_wise.sum(self.comp_dim)
+
+        self.total = self.sample_wise.mean()
+```
+
+ * Performs boilerplate code.
+
+
+## Next steps
+
+ * Read code of [``ParameterSet`` class](https://github.com/breze-no-salt/breze/blob/d41182ac6cdb1ce544b3d7c921ea2391b4a0592f/breze/arch/util.py#L265)
+ * Read code of [``SupervisedModel`` class](https://github.com/breze-no-salt/breze/blob/d41182ac6cdb1ce544b3d7c921ea2391b4a0592f/breze/learn/base.py#L179)
+ * Ask Justin to do the same again.
+
+## Questions?
+
+Max K or myself.
